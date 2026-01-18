@@ -268,8 +268,8 @@ def check_authentication() -> bool:
             
             # Save to file for persistence
             save_credentials(user_email, credentials, user_info)
-            # Save last user email for persistence across page refreshes
-            save_last_user_email(user_email)
+            # Note: We don't save to shared .last_user.txt to prevent cross-device login issues
+            # Each browser session uses its own session state which persists across page refreshes
             
             # Clear the code from URL
             st.query_params.clear()
@@ -280,17 +280,13 @@ def check_authentication() -> bool:
             return False
     
     # If not authenticated in session state, try loading from file
-    # This allows persistence across page refreshes on the same device
+    # SECURITY: Only use session state to identify which user's credentials to load
+    # This ensures each device/browser session is independent
+    # Session state persists across page refreshes within the same browser session
     if not st.session_state.get('authenticated'):
-        # First, try to get email from session state (for same session)
+        # Only use email from session state (device/browser-specific)
+        # Do NOT load from shared file as it would cause cross-device login issues
         stored_email = st.session_state.get('last_authenticated_email')
-        
-        # If not in session state, try to load from file (for persistence across refreshes)
-        if not stored_email:
-            stored_email = load_last_user_email()
-            if stored_email:
-                # Restore to session state for this session
-                st.session_state.last_authenticated_email = stored_email
         
         if stored_email:
             # We know which user's credentials to load
@@ -319,17 +315,14 @@ def check_authentication() -> bool:
                                 # Credentials are invalid, remove the file
                                 print(f"Credentials invalid, removing file: {str(e)}")
                                 delete_credentials_file(stored_email)
-                                # Clear last user email if credentials are invalid
-                                if load_last_user_email() == stored_email:
-                                    clear_last_user_email()
+                                # Clear session state
+                                if 'last_authenticated_email' in st.session_state:
+                                    del st.session_state['last_authenticated_email']
                     else:
                         # Email mismatch - security issue, clear the stored email
                         print(f"Security: Email mismatch. Expected {stored_email}, got {user_info.get('email')}")
                         if 'last_authenticated_email' in st.session_state:
                             del st.session_state['last_authenticated_email']
-                        # Clear last user email file if there's a mismatch
-                        if load_last_user_email() == stored_email:
-                            clear_last_user_email()
     
     return st.session_state.get('authenticated', False)
 
@@ -365,10 +358,9 @@ def logout():
     email = st.session_state.get('last_authenticated_email') or (st.session_state.get('user_info') or {}).get('email')
     if email:
         delete_credentials_file(email)
-        # Clear last user email so user won't be auto-logged in on next visit
-        clear_last_user_email()
     
     # Clear all authentication-related session state
+    # Session state is device/browser-specific, so this only affects the current device
     for key in ['authenticated', 'user_info', 'user_id', 'credentials', 'oauth_state', 'last_authenticated_email']:
         if key in st.session_state:
             del st.session_state[key]
