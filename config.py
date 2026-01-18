@@ -25,11 +25,26 @@ GEMINI_API_KEY = get_gemini_api_key()
 GEMINI_MODEL = "gemini-2.0-flash-exp"  # Using Gemini 2.0 Flash as specified
 
 # Database Configuration
+# Try Streamlit secrets first, then environment variables
+def get_database_url() -> str:
+    """Get database URL from Streamlit secrets or environment variables."""
+    # Try Streamlit secrets first (for Streamlit Cloud)
+    try:
+        if hasattr(st, 'secrets') and st.secrets:
+            db_url = st.secrets.get("DATABASE_URL", "")
+            if db_url:
+                return db_url
+    except (AttributeError, KeyError, TypeError):
+        pass
+    
+    # Fallback to environment variables (for local development)
+    return os.getenv("DATABASE_URL", "")
+
 # PostgreSQL connection string format: postgresql://user:password@host:port/database
 # Example: postgresql://postgres:password@localhost:5432/memowrite
 # For cloud deployments: Use your cloud provider's PostgreSQL connection string
 # (e.g., Heroku Postgres, AWS RDS, Supabase, Neon, etc.)
-DATABASE_URL = os.getenv("DATABASE_URL", "")
+DATABASE_URL = get_database_url()
 UPLOADS_DIR = "data/uploads"
 
 # Application Settings
