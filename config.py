@@ -1,11 +1,27 @@
 """Configuration settings for MemoWrite."""
 import os
+import streamlit as st
 from dotenv import load_dotenv
 
 load_dotenv()
 
 # Gemini API Configuration
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+# Try Streamlit secrets first, then environment variables
+def get_gemini_api_key() -> str:
+    """Get Gemini API key from Streamlit secrets or environment variables."""
+    # Try Streamlit secrets first (for Streamlit Cloud)
+    try:
+        if hasattr(st, 'secrets') and st.secrets:
+            api_key = st.secrets.get("GEMINI_API_KEY", "")
+            if api_key:
+                return api_key
+    except (AttributeError, KeyError, TypeError):
+        pass
+    
+    # Fallback to environment variables (for local development)
+    return os.getenv("GEMINI_API_KEY", "")
+
+GEMINI_API_KEY = get_gemini_api_key()
 GEMINI_MODEL = "gemini-2.0-flash-exp"  # Using Gemini 2.0 Flash as specified
 
 # Database Configuration
