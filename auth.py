@@ -171,6 +171,45 @@ def delete_credentials_file(email: str):
         print(f"Warning: Failed to delete credentials file: {str(e)}")
 
 
+def get_last_user_file() -> Path:
+    """Get the file path for storing the last authenticated user's email."""
+    return CREDENTIALS_DIR / ".last_user.txt"
+
+
+def save_last_user_email(email: str):
+    """Save the last authenticated user's email for persistence across page refreshes."""
+    try:
+        last_user_file = get_last_user_file()
+        with open(last_user_file, 'w') as f:
+            f.write(email)
+    except Exception as e:
+        print(f"Warning: Failed to save last user email: {str(e)}")
+
+
+def load_last_user_email() -> Optional[str]:
+    """Load the last authenticated user's email."""
+    try:
+        last_user_file = get_last_user_file()
+        if last_user_file.exists():
+            with open(last_user_file, 'r') as f:
+                email = f.read().strip()
+                if email:
+                    return email
+    except Exception as e:
+        print(f"Warning: Failed to load last user email: {str(e)}")
+    return None
+
+
+def clear_last_user_email():
+    """Clear the last authenticated user's email (e.g., on logout)."""
+    try:
+        last_user_file = get_last_user_file()
+        if last_user_file.exists():
+            last_user_file.unlink()
+    except Exception as e:
+        print(f"Warning: Failed to clear last user email: {str(e)}")
+
+
 def refresh_credentials_if_needed(credentials):
     """Refresh OAuth credentials if they are expired or about to expire."""
     if credentials.expired and credentials.refresh_token:
@@ -205,11 +244,6 @@ def check_authentication() -> bool:
             if refresh_credentials_if_needed(credentials):
                 return True
     
-    # Try to load credentials from file (for persistence across page refreshes)
-    # SECURITY: Only load credentials if we know which user's credentials to load
-    # We check for stored email in session state to identify the user
-    stored_email = st.session_state.get('last_authenticated_email')
-    
     # Check for authorization code in URL (after OAuth redirect)
     query_params = st.query_params
     
@@ -234,6 +268,8 @@ def check_authentication() -> bool:
             
             # Save to file for persistence
             save_credentials(user_email, credentials, user_info)
+            # Save last user email for persistence across page refreshes
+            save_last_user_email(user_email)
             
             # Clear the code from URL
             st.query_params.clear()
@@ -244,12 +280,18 @@ def check_authentication() -> bool:
             return False
     
     # If not authenticated in session state, try loading from file
-    # SECURITY: Only load credentials if we know which user's credentials to load
-    # Never automatically load the most recent file as it could belong to a different user
+    # This allows persistence across page refreshes on the same device
     if not st.session_state.get('authenticated'):
-        # Only try to load credentials if we have a stored email for this session
-        # This ensures we only load credentials for the user who started this session
+        # First, try to get email from session state (for same session)
         stored_email = st.session_state.get('last_authenticated_email')
+        
+        # If not in session state, try to load from file (for persistence across refreshes)
+        if not stored_email:
+            stored_email = load_last_user_email()
+            if stored_email:
+                # Restore to session state for this session
+                st.session_state.last_authenticated_email = stored_email
+        
         if stored_email:
             # We know which user's credentials to load
             saved_data = load_credentials(stored_email)
@@ -277,11 +319,17 @@ def check_authentication() -> bool:
                                 # Credentials are invalid, remove the file
                                 print(f"Credentials invalid, removing file: {str(e)}")
                                 delete_credentials_file(stored_email)
+                                # Clear last user email if credentials are invalid
+                                if load_last_user_email() == stored_email:
+                                    clear_last_user_email()
                     else:
                         # Email mismatch - security issue, clear the stored email
                         print(f"Security: Email mismatch. Expected {stored_email}, got {user_info.get('email')}")
                         if 'last_authenticated_email' in st.session_state:
                             del st.session_state['last_authenticated_email']
+                        # Clear last user email file if there's a mismatch
+                        if load_last_user_email() == stored_email:
+                            clear_last_user_email()
     
     return st.session_state.get('authenticated', False)
 
@@ -317,6 +365,8 @@ def logout():
     email = st.session_state.get('last_authenticated_email') or (st.session_state.get('user_info') or {}).get('email')
     if email:
         delete_credentials_file(email)
+        # Clear last user email so user won't be auto-logged in on next visit
+        clear_last_user_email()
     
     # Clear all authentication-related session state
     for key in ['authenticated', 'user_info', 'user_id', 'credentials', 'oauth_state', 'last_authenticated_email']:
