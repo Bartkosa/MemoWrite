@@ -26,8 +26,35 @@ class Database:
         self._create_tables()
     
     def _get_connection(self):
-        """Get database connection."""
-        return psycopg2.connect(self.db_url)
+        """Get database connection with SSL support for cloud databases."""
+        # Parse connection string to check if SSL is needed
+        # For cloud databases (Supabase, Neon, etc.), SSL is typically required
+        # Add sslmode=require if not already specified
+        db_url = self.db_url
+        
+        if 'sslmode=' not in db_url.lower():
+            # Check if it's a cloud database (common cloud hosts)
+            cloud_hosts = ['supabase.co', 'neon.tech', 'aws', 'amazonaws.com', 
+                          'herokuapp.com', 'azure', 'cloud.google.com']
+            is_cloud = any(host in db_url.lower() for host in cloud_hosts)
+            
+            if is_cloud:
+                # Add sslmode=require for cloud databases
+                separator = '&' if '?' in db_url else '?'
+                db_url = f"{db_url}{separator}sslmode=require"
+        
+        try:
+            return psycopg2.connect(db_url)
+        except psycopg2.OperationalError as e:
+            # If connection fails, try with sslmode=prefer (more lenient)
+            if 'sslmode=require' in db_url:
+                # Try with prefer instead
+                db_url_prefer = db_url.replace('sslmode=require', 'sslmode=prefer')
+                try:
+                    return psycopg2.connect(db_url_prefer)
+                except:
+                    pass
+            raise e
     
     def _get_table_columns(self, cursor, table_name):
         """Get column names for a table."""
