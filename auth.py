@@ -13,15 +13,29 @@ SCOPES = ["openid", "https://www.googleapis.com/auth/userinfo.email", "https://w
 
 def get_client_config() -> dict:
     """Get OAuth client configuration from secrets or environment variables."""
-    try:
-        client_id = st.secrets.get("GOOGLE_CLIENT_ID", "")
-    except:
-        client_id = os.getenv("GOOGLE_CLIENT_ID", "")
+    client_id = ""
+    client_secret = ""
     
+    # Try to get from Streamlit secrets first
     try:
-        client_secret = st.secrets.get("GOOGLE_CLIENT_SECRET", "")
-    except:
+        if hasattr(st, 'secrets') and st.secrets:
+            client_id = st.secrets.get("GOOGLE_CLIENT_ID", "")
+            client_secret = st.secrets.get("GOOGLE_CLIENT_SECRET", "")
+    except (AttributeError, KeyError, TypeError):
+        pass
+    
+    # Fallback to environment variables
+    if not client_id:
+        client_id = os.getenv("GOOGLE_CLIENT_ID", "")
+    if not client_secret:
         client_secret = os.getenv("GOOGLE_CLIENT_SECRET", "")
+    
+    # Validate that we have credentials
+    if not client_id or not client_secret:
+        raise ValueError(
+            "Missing OAuth credentials. Please set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET "
+            "in Streamlit secrets or environment variables."
+        )
     
     return {
         "web": {
@@ -30,8 +44,7 @@ def get_client_config() -> dict:
             "auth_uri": "https://accounts.google.com/o/oauth2/auth",
             "token_uri": "https://oauth2.googleapis.com/token",
             "redirect_uris": [
-                "http://localhost:8501",
-                "https://*.streamlit.app"
+                "http://localhost:8501/",
             ]
         }
     }
@@ -39,13 +52,39 @@ def get_client_config() -> dict:
 
 def get_redirect_uri() -> str:
     """Get the redirect URI based on the current environment."""
-    # Check if we're in Streamlit Cloud
-    if os.getenv("STREAMLIT_SHARING", "").lower() == "true" or ".streamlit.app" in os.getenv("STREAMLIT_SERVER_BASE_URL", ""):
-        # Streamlit Cloud uses a different URL format
-        base_url = os.getenv("STREAMLIT_SERVER_BASE_URL", "")
-        return f"{base_url}/"
-    else:
-        return "http://localhost:8501"
+    # First, try to get from Streamlit secrets (most reliable - user can set it explicitly)
+    try:
+        if hasattr(st, 'secrets') and st.secrets:
+            redirect_uri = st.secrets.get("REDIRECT_URI", "")
+            if redirect_uri:
+                return redirect_uri
+    except (AttributeError, KeyError, TypeError):
+        pass
+    
+    # Check environment variable (set by Streamlit Cloud)
+    base_url = os.getenv("STREAMLIT_SERVER_BASE_URL", "")
+    if base_url:
+        # Ensure proper format
+        if not base_url.startswith('http'):
+            base_url = f"https://{base_url}"
+        # Ensure trailing slash
+        return f"{base_url.rstrip('/')}/"
+    
+    # Check if we're on Streamlit Cloud by looking for the domain pattern
+    # This is a fallback detection method
+    try:
+        # Check for Streamlit Cloud indicators
+        if os.getenv("STREAMLIT_SHARING", "").lower() == "true":
+            # We're on Streamlit Cloud, but need the actual URL
+            # Try to construct from app name if available
+            app_name = os.getenv("STREAMLIT_APP_NAME", "")
+            if app_name:
+                return f"https://{app_name}.streamlit.app/"
+    except:
+        pass
+    
+    # Default: localhost for local development
+    return "http://localhost:8501/"
 
 
 def get_flow() -> Flow:
