@@ -35,6 +35,10 @@ wheels/
 data/uploads/*
 !data/uploads/.gitkeep
 
+# Authentication credentials (persisted OAuth tokens)
+data/credentials/
+*.pickle
+
 # IDE
 .vscode/
 .idea/
