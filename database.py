@@ -1,24 +1,42 @@
 """Database operations for MemoWrite."""
-import sqlite3
 import os
 from datetime import datetime, date
 from typing import List, Dict, Optional, Tuple
-from config import DATABASE_PATH
+from config import DATABASE_URL
+
+# PostgreSQL adapter
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from psycopg2 import sql
 
 
 class Database:
-    """Manages SQLite database operations."""
+    """Manages PostgreSQL database operations."""
     
     def __init__(self):
         """Initialize database connection and create tables if they don't exist."""
-        self.db_path = DATABASE_PATH
+        if not DATABASE_URL:
+            raise ValueError(
+                "DATABASE_URL environment variable is required. "
+                "Please set it in your .env file or environment variables. "
+                "Format: postgresql://username:password@host:port/database"
+            )
+        
+        self.db_url = DATABASE_URL
         self._create_tables()
     
     def _get_connection(self):
         """Get database connection."""
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        return conn
+        return psycopg2.connect(self.db_url)
+    
+    def _get_table_columns(self, cursor, table_name):
+        """Get column names for a table."""
+        cursor.execute("""
+            SELECT column_name 
+            FROM information_schema.columns 
+            WHERE table_name = %s
+        """, (table_name,))
+        return [row[0] for row in cursor.fetchall()]
     
     def _create_tables(self):
         """Create all necessary database tables."""
@@ -37,24 +55,26 @@ class Database:
         """)
         
         # Check if questions table exists and has user_id column
-        cursor.execute("PRAGMA table_info(questions)")
-        questions_columns = [col[1] for col in cursor.fetchall()]
-        table_exists = len(questions_columns) > 0
-        
-        if table_exists and 'user_id' not in questions_columns:
-            # Table exists but no user_id - add it (migration)
-            try:
-                cursor.execute("ALTER TABLE questions ADD COLUMN user_id TEXT")
-                # Migrate existing data - set a default user_id for existing questions
-                # This is a one-time migration, existing data will be assigned to a system user
-                cursor.execute("UPDATE questions SET user_id = 'system' WHERE user_id IS NULL")
-            except sqlite3.OperationalError:
-                pass
+        try:
+            questions_columns = self._get_table_columns(cursor, 'questions')
+            table_exists = len(questions_columns) > 0
+            
+            if table_exists and 'user_id' not in questions_columns:
+                # Table exists but no user_id - add it (migration)
+                try:
+                    cursor.execute("ALTER TABLE questions ADD COLUMN user_id TEXT")
+                    # Migrate existing data - set a default user_id for existing questions
+                    cursor.execute("UPDATE questions SET user_id = 'system' WHERE user_id IS NULL")
+                except Exception:
+                    pass
+        except Exception:
+            # Table doesn't exist yet
+            pass
         
         # Questions table - now with user_id
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS questions (
-                question_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                question_id SERIAL PRIMARY KEY,
                 user_id TEXT NOT NULL,
                 question_text TEXT NOT NULL,
                 reference_answer TEXT NOT NULL,
@@ -65,27 +85,30 @@ class Database:
         """)
         
         # Check if user_answers table exists and has user_id column
-        cursor.execute("PRAGMA table_info(user_answers)")
-        user_answers_columns = [col[1] for col in cursor.fetchall()]
-        table_exists_answers = len(user_answers_columns) > 0
-        
-        if table_exists_answers and 'user_id' not in user_answers_columns:
-            # Table exists but no user_id - add it (migration)
-            try:
-                cursor.execute("ALTER TABLE user_answers ADD COLUMN user_id TEXT")
-                # Migrate: get user_id from associated question
-                cursor.execute("""
-                    UPDATE user_answers 
-                    SET user_id = (SELECT user_id FROM questions WHERE questions.question_id = user_answers.question_id)
-                    WHERE user_id IS NULL
-                """)
-            except sqlite3.OperationalError:
-                pass
+        try:
+            user_answers_columns = self._get_table_columns(cursor, 'user_answers')
+            table_exists_answers = len(user_answers_columns) > 0
+            
+            if table_exists_answers and 'user_id' not in user_answers_columns:
+                # Table exists but no user_id - add it (migration)
+                try:
+                    cursor.execute("ALTER TABLE user_answers ADD COLUMN user_id TEXT")
+                    # Migrate: get user_id from associated question
+                    cursor.execute("""
+                        UPDATE user_answers 
+                        SET user_id = (SELECT user_id FROM questions WHERE questions.question_id = user_answers.question_id)
+                        WHERE user_id IS NULL
+                    """)
+                except Exception:
+                    pass
+        except Exception:
+            # Table doesn't exist yet
+            pass
         
         # User answers table - add user_id for additional safety
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS user_answers (
-                answer_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                answer_id SERIAL PRIMARY KEY,
                 question_id INTEGER NOT NULL,
                 user_id TEXT NOT NULL,
                 user_answer TEXT NOT NULL,
@@ -101,7 +124,7 @@ class Database:
         # Spaced repetition table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS spaced_repetition (
-                sr_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sr_id SERIAL PRIMARY KEY,
                 question_id INTEGER NOT NULL UNIQUE,
                 ease_factor REAL DEFAULT 2.5,
                 interval INTEGER DEFAULT 1,
@@ -115,7 +138,7 @@ class Database:
         # User progress table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS user_progress (
-                progress_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                progress_id SERIAL PRIMARY KEY,
                 question_id INTEGER NOT NULL,
                 mastery_level REAL DEFAULT 0.0,
                 total_attempts INTEGER DEFAULT 0,
@@ -132,27 +155,27 @@ class Database:
     def get_or_create_user(self, user_id: str, email: str, name: str = None, picture_url: str = None) -> str:
         """Get existing user or create new user. Returns user_id."""
         conn = self._get_connection()
-        cursor = conn.cursor()
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
         
         # Try to get existing user
-        cursor.execute("SELECT user_id FROM users WHERE user_id = ? OR email = ?", (user_id, email))
+        cursor.execute("SELECT user_id FROM users WHERE user_id = %s OR email = %s", (user_id, email))
         existing = cursor.fetchone()
         
         if existing:
             # Update user info if provided
             if name or picture_url:
                 cursor.execute("""
-                    UPDATE users SET name = COALESCE(?, name), picture_url = COALESCE(?, picture_url)
-                    WHERE user_id = ?
-                """, (name, picture_url, existing[0]))
+                    UPDATE users SET name = COALESCE(%s, name), picture_url = COALESCE(%s, picture_url)
+                    WHERE user_id = %s
+                """, (name, picture_url, existing['user_id']))
             conn.commit()
             conn.close()
-            return existing[0]
+            return existing['user_id']
         else:
             # Create new user
             cursor.execute("""
                 INSERT INTO users (user_id, email, name, picture_url)
-                VALUES (?, ?, ?, ?)
+                VALUES (%s, %s, %s, %s)
             """, (user_id, email, name, picture_url))
             conn.commit()
             conn.close()
@@ -163,23 +186,24 @@ class Database:
         """Add a new question to the database for a specific user."""
         conn = self._get_connection()
         cursor = conn.cursor()
+        
         cursor.execute("""
             INSERT INTO questions (user_id, question_text, reference_answer, source_pdf)
-            VALUES (?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s)
+            RETURNING question_id
         """, (user_id, question_text, reference_answer, source_pdf))
-        question_id = cursor.lastrowid
-        conn.commit()
+        question_id = cursor.fetchone()[0]
         
         # Initialize spaced repetition entry
         cursor.execute("""
             INSERT INTO spaced_repetition (question_id, next_review_date)
-            VALUES (?, ?)
+            VALUES (%s, %s)
         """, (question_id, date.today()))
         
         # Initialize progress entry
         cursor.execute("""
             INSERT INTO user_progress (question_id)
-            VALUES (?)
+            VALUES (%s)
         """, (question_id,))
         
         conn.commit()
@@ -189,8 +213,9 @@ class Database:
     def get_question(self, user_id: str, question_id: int) -> Optional[Dict]:
         """Get a question by ID for a specific user."""
         conn = self._get_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM questions WHERE question_id = ? AND user_id = ?", (question_id, user_id))
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        
+        cursor.execute("SELECT * FROM questions WHERE question_id = %s AND user_id = %s", (question_id, user_id))
         row = cursor.fetchone()
         conn.close()
         return dict(row) if row else None
@@ -198,8 +223,9 @@ class Database:
     def get_all_questions(self, user_id: str) -> List[Dict]:
         """Get all questions for a specific user."""
         conn = self._get_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM questions WHERE user_id = ? ORDER BY question_id", (user_id,))
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        
+        cursor.execute("SELECT * FROM questions WHERE user_id = %s ORDER BY question_id", (user_id,))
         rows = cursor.fetchall()
         conn.close()
         return [dict(row) for row in rows]
@@ -208,7 +234,8 @@ class Database:
         """Get total number of questions for a specific user."""
         conn = self._get_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM questions WHERE user_id = ?", (user_id,))
+        
+        cursor.execute("SELECT COUNT(*) FROM questions WHERE user_id = %s", (user_id,))
         count = cursor.fetchone()[0]
         conn.close()
         return count
@@ -219,16 +246,15 @@ class Database:
         cursor = conn.cursor()
         
         # Get question IDs for this user
-        cursor.execute("SELECT question_id FROM questions WHERE user_id = ?", (user_id,))
+        cursor.execute("SELECT question_id FROM questions WHERE user_id = %s", (user_id,))
         question_ids = [row[0] for row in cursor.fetchall()]
         
         if question_ids:
-            placeholders = ','.join('?' * len(question_ids))
-            # Delete in order to respect foreign key constraints
+            placeholders = ','.join(['%s'] * len(question_ids))
             cursor.execute(f"DELETE FROM user_answers WHERE question_id IN ({placeholders})", question_ids)
             cursor.execute(f"DELETE FROM spaced_repetition WHERE question_id IN ({placeholders})", question_ids)
             cursor.execute(f"DELETE FROM user_progress WHERE question_id IN ({placeholders})", question_ids)
-            cursor.execute("DELETE FROM questions WHERE user_id = ?", (user_id,))
+            cursor.execute("DELETE FROM questions WHERE user_id = %s", (user_id,))
         
         conn.commit()
         conn.close()
@@ -240,8 +266,8 @@ class Database:
         try:
             cursor.execute("""
                 UPDATE questions
-                SET question_text = ?, reference_answer = ?
-                WHERE question_id = ? AND user_id = ?
+                SET question_text = %s, reference_answer = %s
+                WHERE question_id = %s AND user_id = %s
             """, (question_text, reference_answer, question_id, user_id))
             conn.commit()
             conn.close()
@@ -256,16 +282,16 @@ class Database:
         cursor = conn.cursor()
         try:
             # First verify the question belongs to the user
-            cursor.execute("SELECT question_id FROM questions WHERE question_id = ? AND user_id = ?", (question_id, user_id))
+            cursor.execute("SELECT question_id FROM questions WHERE question_id = %s AND user_id = %s", (question_id, user_id))
             if not cursor.fetchone():
                 conn.close()
                 return False
             
             # Delete in order to respect foreign key constraints
-            cursor.execute("DELETE FROM user_answers WHERE question_id = ?", (question_id,))
-            cursor.execute("DELETE FROM spaced_repetition WHERE question_id = ?", (question_id,))
-            cursor.execute("DELETE FROM user_progress WHERE question_id = ?", (question_id,))
-            cursor.execute("DELETE FROM questions WHERE question_id = ? AND user_id = ?", (question_id, user_id))
+            cursor.execute("DELETE FROM user_answers WHERE question_id = %s", (question_id,))
+            cursor.execute("DELETE FROM spaced_repetition WHERE question_id = %s", (question_id,))
+            cursor.execute("DELETE FROM user_progress WHERE question_id = %s", (question_id,))
+            cursor.execute("DELETE FROM questions WHERE question_id = %s AND user_id = %s", (question_id, user_id))
             deleted = cursor.rowcount > 0
             conn.commit()
             conn.close()
@@ -280,11 +306,14 @@ class Database:
         """Add a user's answer with grading results."""
         conn = self._get_connection()
         cursor = conn.cursor()
+        
         cursor.execute("""
             INSERT INTO user_answers (user_id, question_id, user_answer, score, feedback, missing_concepts)
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            RETURNING answer_id
         """, (user_id, question_id, user_answer, score, feedback, missing_concepts))
-        answer_id = cursor.lastrowid
+        answer_id = cursor.fetchone()[0]
+        
         conn.commit()
         conn.close()
         return answer_id
@@ -292,10 +321,11 @@ class Database:
     def get_user_answers(self, question_id: int) -> List[Dict]:
         """Get all user answers for a question."""
         conn = self._get_connection()
-        cursor = conn.cursor()
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        
         cursor.execute("""
             SELECT * FROM user_answers 
-            WHERE question_id = ? 
+            WHERE question_id = %s 
             ORDER BY timestamp DESC
         """, (question_id,))
         rows = cursor.fetchall()
@@ -306,9 +336,10 @@ class Database:
     def get_spaced_repetition(self, question_id: int) -> Optional[Dict]:
         """Get spaced repetition data for a question."""
         conn = self._get_connection()
-        cursor = conn.cursor()
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        
         cursor.execute("""
-            SELECT * FROM spaced_repetition WHERE question_id = ?
+            SELECT * FROM spaced_repetition WHERE question_id = %s
         """, (question_id,))
         row = cursor.fetchone()
         conn.close()
@@ -322,11 +353,12 @@ class Database:
         cursor = conn.cursor()
         if last_review_date is None:
             last_review_date = date.today()
+        
         cursor.execute("""
             UPDATE spaced_repetition
-            SET ease_factor = ?, interval = ?, repetitions = ?, 
-                next_review_date = ?, last_review_date = ?
-            WHERE question_id = ?
+            SET ease_factor = %s, interval = %s, repetitions = %s, 
+                next_review_date = %s, last_review_date = %s
+            WHERE question_id = %s
         """, (ease_factor, interval, repetitions, next_review_date, last_review_date, question_id))
         conn.commit()
         conn.close()
@@ -334,13 +366,14 @@ class Database:
     def get_questions_due_for_review(self, user_id: str) -> List[Dict]:
         """Get all questions that are due for review for a specific user."""
         conn = self._get_connection()
-        cursor = conn.cursor()
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        
         today = date.today()
         cursor.execute("""
             SELECT q.*, sr.*
             FROM questions q
             JOIN spaced_repetition sr ON q.question_id = sr.question_id
-            WHERE q.user_id = ? AND sr.next_review_date <= ?
+            WHERE q.user_id = %s AND sr.next_review_date <= %s
             ORDER BY sr.next_review_date ASC, sr.ease_factor ASC
         """, (user_id, today))
         rows = cursor.fetchall()
@@ -355,12 +388,13 @@ class Database:
         
         # If no questions are due, get the one with the earliest next_review_date for this user
         conn = self._get_connection()
-        cursor = conn.cursor()
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        
         cursor.execute("""
             SELECT q.*, sr.*
             FROM questions q
             JOIN spaced_repetition sr ON q.question_id = sr.question_id
-            WHERE q.user_id = ?
+            WHERE q.user_id = %s
             ORDER BY sr.next_review_date ASC
             LIMIT 1
         """, (user_id,))
@@ -372,11 +406,11 @@ class Database:
     def update_progress(self, question_id: int, score: float):
         """Update user progress for a question."""
         conn = self._get_connection()
-        cursor = conn.cursor()
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
         
         # Get current progress
         cursor.execute("""
-            SELECT * FROM user_progress WHERE question_id = ?
+            SELECT * FROM user_progress WHERE question_id = %s
         """, (question_id,))
         row = cursor.fetchone()
         
@@ -391,16 +425,16 @@ class Database:
             
             cursor.execute("""
                 UPDATE user_progress
-                SET mastery_level = ?, total_attempts = ?, correct_attempts = ?,
+                SET mastery_level = %s, total_attempts = %s, correct_attempts = %s,
                     last_reviewed = CURRENT_TIMESTAMP
-                WHERE question_id = ?
+                WHERE question_id = %s
             """, (mastery_level, total_attempts, correct_attempts, question_id))
         else:
             # Create new progress entry
             mastery_level = 100.0 if score >= 70 else 0.0
             cursor.execute("""
                 INSERT INTO user_progress (question_id, mastery_level, total_attempts, correct_attempts, last_reviewed)
-                VALUES (?, ?, 1, ?, CURRENT_TIMESTAMP)
+                VALUES (%s, %s, 1, %s, CURRENT_TIMESTAMP)
             """, (question_id, mastery_level, 1 if score >= 70 else 0))
         
         conn.commit()
@@ -409,7 +443,7 @@ class Database:
     def get_progress_stats(self, user_id: str) -> Dict:
         """Get overall progress statistics for a specific user."""
         conn = self._get_connection()
-        cursor = conn.cursor()
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
         
         cursor.execute("""
             SELECT 
@@ -419,7 +453,7 @@ class Database:
                 SUM(p.correct_attempts) as total_correct
             FROM user_progress p
             JOIN questions q ON p.question_id = q.question_id
-            WHERE q.user_id = ?
+            WHERE q.user_id = %s
         """, (user_id,))
         row = cursor.fetchone()
         conn.close()
@@ -436,15 +470,15 @@ class Database:
     def get_all_progress(self, user_id: str) -> List[Dict]:
         """Get progress for all questions for a specific user."""
         conn = self._get_connection()
-        cursor = conn.cursor()
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+        
         cursor.execute("""
             SELECT p.*, q.question_text
             FROM user_progress p
             JOIN questions q ON p.question_id = q.question_id
-            WHERE q.user_id = ?
+            WHERE q.user_id = %s
             ORDER BY p.mastery_level ASC, p.last_reviewed DESC
         """, (user_id,))
         rows = cursor.fetchall()
         conn.close()
         return [dict(row) for row in rows]
-

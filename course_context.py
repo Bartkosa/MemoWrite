@@ -2,7 +2,6 @@
 import pdfplumber
 import os
 from typing import List, Dict
-from config import DATABASE_PATH
 
 
 class CourseContext:

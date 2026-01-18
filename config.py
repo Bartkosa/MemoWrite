@@ -25,7 +25,11 @@ GEMINI_API_KEY = get_gemini_api_key()
 GEMINI_MODEL = "gemini-2.0-flash-exp"  # Using Gemini 2.0 Flash as specified
 
 # Database Configuration
-DATABASE_PATH = os.getenv("DATABASE_PATH", "data/course_notes.db")
+# PostgreSQL connection string format: postgresql://user:password@host:port/database
+# Example: postgresql://postgres:password@localhost:5432/memowrite
+# For cloud deployments: Use your cloud provider's PostgreSQL connection string
+# (e.g., Heroku Postgres, AWS RDS, Supabase, Neon, etc.)
+DATABASE_URL = os.getenv("DATABASE_URL", "")
 UPLOADS_DIR = "data/uploads"
 
 # Application Settings
@@ -42,6 +46,5 @@ GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
 
 # Ensure directories exist
-os.makedirs(os.path.dirname(DATABASE_PATH), exist_ok=True)
 os.makedirs(UPLOADS_DIR, exist_ok=True)
 
