@@ -4,6 +4,7 @@ import os
 import pandas as pd
 import re
 from datetime import date
+from typing import List, Dict
 from database import Database
 from pdf_parser import PDFParser
 from grader import Grader
@@ -86,17 +87,22 @@ def main():
     user_picture = get_user_picture()
     
     # Get or create user in database
-    if user_email and 'user_id' not in st.session_state:
-        # Use email as user_id for simplicity
-        user_id = st.session_state.db.get_or_create_user(
-            user_id=user_email,
-            email=user_email,
-            name=user_name,
-            picture_url=user_picture
-        )
-        st.session_state.user_id = user_id
-    
-    user_id = st.session_state.user_id
+    if user_email:
+        # Ensure user_id is set in session state
+        if 'user_id' not in st.session_state or not st.session_state.user_id:
+            # Use email as user_id for simplicity
+            user_id = st.session_state.db.get_or_create_user(
+                user_id=user_email,
+                email=user_email,
+                name=user_name,
+                picture_url=user_picture
+            )
+            st.session_state.user_id = user_id
+        else:
+            user_id = st.session_state.user_id
+    else:
+        st.error("❌ User email not available. Please log in again.")
+        st.stop()
     
     # Display user info in sidebar
     st.sidebar.title("User")
@@ -119,10 +125,26 @@ def main():
     
     # Sidebar navigation
     st.sidebar.title("Navigation")
-    page = st.sidebar.radio(
+    page_options = ["📤 Upload Questions", "📖 Study", "📊 Progress Dashboard", "⚙️ Manage Questions"]
+    
+    # Get page from session state or use radio selection
+    if 'current_page' not in st.session_state:
+        st.session_state.current_page = "📤 Upload Questions"
+    
+    # If page was set programmatically (e.g., from "Go study!" button), use that
+    page = st.session_state.current_page
+    
+    # Create radio button and update session state if user manually selects
+    selected_page = st.sidebar.radio(
         "Go to",
-        ["📤 Upload Questions", "📖 Study", "📊 Progress Dashboard", "⚙️ Manage Questions"]
+        page_options,
+        index=page_options.index(page) if page in page_options else 0
     )
+    
+    # Update session state if user manually changed page
+    if selected_page != st.session_state.current_page:
+        st.session_state.current_page = selected_page
+        page = selected_page
     
     if page == "📤 Upload Questions":
         show_upload_page()
@@ -134,111 +156,242 @@ def main():
         show_manage_questions_page()
 
 
+def save_questions_to_database(qa_pairs: List[Dict[str, str]], source_pdf_name: str) -> int:
+    """Save Q&A pairs to database.
+    
+    Args:
+        qa_pairs: List of dictionaries with 'question' and 'answer' keys
+        source_pdf_name: Name of the source PDF file
+        
+    Returns:
+        Number of questions successfully saved
+    """
+    user_id = st.session_state.get('user_id')
+    if not user_id:
+        # Try to get or create user if not set
+        user_email = get_user_email()
+        if user_email:
+            user_name = get_user_name()
+            user_picture = get_user_picture()
+            user_id = st.session_state.db.get_or_create_user(
+                user_id=user_email,
+                email=user_email,
+                name=user_name,
+                picture_url=user_picture
+            )
+            st.session_state.user_id = user_id
+        else:
+            raise Exception("User not authenticated. Please log in again.")
+    
+    saved_count = 0
+    for pair in qa_pairs:
+        try:
+            # Fix spacing before saving
+            question = fix_text_spacing(pair['question'])
+            answer = fix_text_spacing(pair['answer'])
+            
+            st.session_state.db.add_question(
+                user_id=user_id,
+                question_text=question,
+                reference_answer=answer,
+                source_pdf=source_pdf_name
+            )
+            saved_count += 1
+        except Exception as e:
+            st.warning(f"Error saving question: {str(e)}")
+    
+    return saved_count
+
+
 def show_upload_page():
     """Display the PDF upload page."""
     st.header("Upload Exam Questions")
     st.markdown("Upload a PDF file containing exam questions and answers.")
     
-    # Database management section
-    user_id = st.session_state.user_id
-    with st.expander("🗑️ Database Management", expanded=False):
-        st.warning("⚠️ This will delete ALL your questions and progress data!")
-        col1, col2 = st.columns(2)
-        with col1:
-            question_count = st.session_state.db.get_questions_count(user_id)
-            st.metric("Questions in Database", question_count)
-        with col2:
-            if st.button("🗑️ Clear All Questions", type="secondary"):
-                st.session_state.db.delete_all_questions(user_id)
-                st.success("✅ All questions deleted!")
-                st.rerun()
+    # Ensure user_id is set
+    user_id = st.session_state.get('user_id')
+    if not user_id:
+        user_email = get_user_email()
+        if user_email:
+            user_name = get_user_name()
+            user_picture = get_user_picture()
+            user_id = st.session_state.db.get_or_create_user(
+                user_id=user_email,
+                email=user_email,
+                name=user_name,
+                picture_url=user_picture
+            )
+            st.session_state.user_id = user_id
+        else:
+            st.error("❌ User not authenticated. Please log in again.")
+            return
     
-    st.divider()
-    
+    # ========== FILE UPLOAD AND PARSING SECTION ==========
     uploaded_file = st.file_uploader(
         "Choose a PDF file",
         type=['pdf'],
-        help="Upload a PDF with questions and answers"
+        help="Upload a PDF with questions and answers",
+        key="pdf_uploader"
     )
     
+    # Check if we have cached parsed results for this file
+    cached_file_name = st.session_state.get('last_parsed_filename')
+    cached_qa_pairs = st.session_state.get('cached_qa_pairs', [])
+    
+    # If file changed or no cache exists, parse the PDF
+    # Skip parsing if we just saved (to prevent re-parsing after save)
     if uploaded_file is not None:
-        parser = PDFParser()
+        # Reset just_saved flag if a new file is uploaded
+        if cached_file_name != uploaded_file.name:
+            st.session_state.just_saved = False
         
-        with st.spinner("Processing PDF..."):
-            try:
-                # Save uploaded file
-                pdf_path = parser.save_uploaded_pdf(uploaded_file)
+        if not st.session_state.get('just_saved', False):
+            if cached_file_name != uploaded_file.name or not cached_qa_pairs:
+                # New file or no cache - parse it
+                parser = PDFParser()
                 
-                # Parse PDF
-                st.info("Extracting questions and answers using Gemini API...")
-                st.info("📄 Processing page by page to ensure all content is covered...")
-                
-                # Parse with progress updates
-                try:
-                    qa_pairs = parser.parse_with_gemini(pdf_path)
-                except Exception as parse_error:
-                    raise parse_error
-                
-                if qa_pairs:
-                    st.success(f"✅ Successfully extracted {len(qa_pairs)} question-answer pairs!")
-                    
-                    # Show preview of ALL questions
-                    with st.expander(f"📋 Preview all {len(qa_pairs)} extracted Q&A pairs", expanded=True):
-                        for i, pair in enumerate(qa_pairs, 1):
-                            # Fix spacing issues
-                            question = fix_text_spacing(pair['question'])
-                            answer = fix_text_spacing(pair['answer'])
+                with st.spinner("Processing PDF..."):
+                    try:
+                        # Save uploaded file
+                        pdf_path = parser.save_uploaded_pdf(uploaded_file)
+                        
+                        # Parse PDF
+                        st.info("Extracting questions and answers using Gemini API...")
+                        
+                        # Parse with progress updates
+                        try:
+                            qa_pairs = parser.parse_with_gemini(pdf_path)
+                            # Cache the results (even if empty, so we know parsing completed)
+                            st.session_state.last_parsed_filename = uploaded_file.name
+                            st.session_state.cached_qa_pairs = qa_pairs
                             
-                            st.markdown(f"### Question {i} of {len(qa_pairs)}")
-                            st.markdown("**Question:**")
-                            st.text_area(
-                                f"Q{i}",
-                                value=question,
-                                height=min(200, len(question.split('\n')) * 25 + 50),
-                                key=f"preview_q_{i}",
-                                label_visibility="collapsed"
-                            )
-                            st.markdown("**Answer:**")
-                            st.text_area(
-                                f"A{i}",
-                                value=answer,
-                                height=min(300, len(answer.split('\n')) * 25 + 50),
-                                key=f"preview_a_{i}",
-                                label_visibility="collapsed"
-                            )
-                            if i < len(qa_pairs):
-                                st.divider()
-                    
-                    # Store in database
-                    if st.button("💾 Save to Database", type="primary"):
-                        with st.spinner("Saving questions to database..."):
-                            saved_count = 0
-                            for pair in qa_pairs:
-                                try:
-                                    # Fix spacing before saving
-                                    question = fix_text_spacing(pair['question'])
-                                    answer = fix_text_spacing(pair['answer'])
-                                    
-                                    user_id = st.session_state.user_id
-                                    st.session_state.db.add_question(
-                                        user_id=user_id,
-                                        question_text=question,
-                                        reference_answer=answer,
-                                        source_pdf=uploaded_file.name
-                                    )
-                                    saved_count += 1
-                                except Exception as e:
-                                    st.warning(f"Error saving question: {str(e)}")
+                            # Check if parsing returned empty results
+                            if not qa_pairs or len(qa_pairs) == 0:
+                                st.warning("⚠️ No questions and answers found in the PDF. Please check the format.")
+                                return
                             
-                            st.success(f"✅ Saved {saved_count} questions to database!")
-                            st.balloons()
+                            # Show success and rerun to display preview
+                            st.success(f"✅ Successfully extracted {len(qa_pairs)} question-answer pairs! Loading preview...")
                             st.rerun()
-                else:
-                    st.warning("⚠️ No questions and answers found in the PDF. Please check the format.")
-                    
-            except Exception as e:
-                st.error(f"❌ Error processing PDF: {str(e)}")
-                st.info("Tip: Make sure your PDF contains clearly formatted questions and answers.")
+                        except Exception as parse_error:
+                            raise parse_error
+                    except Exception as e:
+                        st.error(f"❌ Error processing PDF: {str(e)}")
+                        st.info("Tip: Make sure your PDF contains clearly formatted questions and answers.")
+                        return
+        elif cached_qa_pairs:
+            # Use cached results - no need to parse again (after save, just show the preview)
+            qa_pairs = cached_qa_pairs
+            if len(qa_pairs) == 0:
+                st.warning("⚠️ No questions and answers found in the PDF. Please check the format.")
+                return
+    
+    # ========== PREVIEW SECTION ==========
+    # Only show preview if we have cached results with at least one Q&A pair
+    # Check both uploaded_file and cached_filename to handle reruns
+    has_uploaded_file = uploaded_file is not None or cached_file_name is not None
+    if has_uploaded_file and cached_qa_pairs and len(cached_qa_pairs) > 0:
+        qa_pairs = cached_qa_pairs
+        st.divider()
+        st.success(f"✅ Successfully extracted {len(qa_pairs)} question-answer pairs!")
+        
+        # Save button at the top
+        col_top1, col_top2 = st.columns([1, 4])
+        with col_top1:
+            if st.button("💾 Save to Database", type="primary", use_container_width=True, key="save_top"):
+                try:
+                    with st.spinner("Saving questions to database..."):
+                        # Use cached filename if uploaded_file is None (after rerun)
+                        source_pdf_name = uploaded_file.name if uploaded_file else cached_file_name
+                        saved_count = save_questions_to_database(qa_pairs, source_pdf_name)
+                        
+                        # Don't clear cache - keep it so preview can still be shown after rerun
+                        # Cache will be cleared automatically when a new file is uploaded
+                        
+                        st.success(f"✅ Saved {saved_count} questions to database!")
+                        st.balloons()
+                        # Set flags
+                        st.session_state.show_go_study = True
+                        st.session_state.just_saved = True  # Prevent re-parsing
+                        st.rerun()
+                except Exception as e:
+                    st.error(f"❌ Error saving to database: {str(e)}")
+        
+        with col_top2:
+            st.info(f"Ready to save {len(qa_pairs)} question-answer pairs to your database.")
+        
+        # Show "Go study!" button if save was successful (at top)
+        if st.session_state.get('show_go_study', False):
+            st.markdown("---")
+            if st.button("📖 Go study!", type="primary", use_container_width=True, key="go_study_top"):
+                # Navigate to Study page
+                st.session_state.current_page = "📖 Study"
+                st.session_state.show_go_study = False
+                st.session_state.just_saved = False  # Reset flag
+                st.rerun()
+        
+        # Show preview of ALL questions
+        with st.expander(f"📋 Preview all {len(qa_pairs)} extracted Q&A pairs", expanded=True):
+            for i, pair in enumerate(qa_pairs, 1):
+                # Fix spacing issues
+                question = fix_text_spacing(pair['question'])
+                answer = fix_text_spacing(pair['answer'])
+                
+                st.markdown(f"### Question {i} of {len(qa_pairs)}")
+                st.markdown("**Question:**")
+                st.text_area(
+                    f"Q{i}",
+                    value=question,
+                    height=min(200, len(question.split('\n')) * 25 + 50),
+                    key=f"preview_q_{i}",
+                    label_visibility="collapsed"
+                )
+                st.markdown("**Answer:**")
+                st.text_area(
+                    f"A{i}",
+                    value=answer,
+                    height=min(300, len(answer.split('\n')) * 25 + 50),
+                    key=f"preview_a_{i}",
+                    label_visibility="collapsed"
+                )
+                if i < len(qa_pairs):
+                    st.divider()
+        
+        # Save button at the bottom
+        st.divider()
+        col_bottom1, col_bottom2 = st.columns([1, 4])
+        with col_bottom1:
+            if st.button("💾 Save to Database", type="primary", use_container_width=True, key="save_bottom"):
+                try:
+                    with st.spinner("Saving questions to database..."):
+                        # Use cached filename if uploaded_file is None (after rerun)
+                        source_pdf_name = uploaded_file.name if uploaded_file else cached_file_name
+                        saved_count = save_questions_to_database(qa_pairs, source_pdf_name)
+                        
+                        # Don't clear cache - keep it so preview can still be shown after rerun
+                        # Cache will be cleared automatically when a new file is uploaded
+                        
+                        st.success(f"✅ Saved {saved_count} questions to database!")
+                        st.balloons()
+                        # Set flags
+                        st.session_state.show_go_study = True
+                        st.session_state.just_saved = True  # Prevent re-parsing
+                        st.rerun()
+                except Exception as e:
+                    st.error(f"❌ Error saving to database: {str(e)}")
+        
+        with col_bottom2:
+            st.info(f"Ready to save {len(qa_pairs)} question-answer pairs to your database.")
+        
+        # Show "Go study!" button at bottom if save was successful
+        if st.session_state.get('show_go_study', False):
+            st.markdown("---")
+            if st.button("📖 Go study!", type="primary", use_container_width=True, key="go_study_bottom"):
+                # Navigate to Study page
+                st.session_state.current_page = "📖 Study"
+                st.session_state.show_go_study = False
+                st.session_state.just_saved = False  # Reset flag
+                st.rerun()
 
 
 def show_study_page():
@@ -253,11 +406,22 @@ def show_study_page():
         st.info("No questions available. Please upload some questions first.")
         return
     
-    # Question selection section
-    col1, col2 = st.columns([2, 1])
+    # Main action: Get Next Question (prominent)
+    st.subheader("Get Next Question")
+    col_main = st.columns([1, 2, 1])
+    with col_main[1]:
+        if st.button("🔄 Get Next Question", type="primary", use_container_width=True, key="get_next_main"):
+            user_id = st.session_state.user_id
+            question_data = st.session_state.db.get_next_question_for_review(user_id)
+            if question_data:
+                st.session_state.current_question = question_data
+                st.session_state.last_grading_result = None
+                st.rerun()
+            else:
+                st.info("No questions due for review. You can select a specific question below.")
     
-    with col1:
-        st.subheader("Select Question")
+    # Alternative: Select specific question (less prominent)
+    with st.expander("🔍 Or select a specific question", expanded=False):
         # Create a dropdown/selectbox for manual question selection
         question_options = {
             f"Q{q['question_id']}: {q['question_text'][:60]}{'...' if len(q['question_text']) > 60 else ''}": q['question_id']
@@ -272,11 +436,9 @@ def show_study_page():
         )
         
         selected_question_id = question_options[selected_question_label]
-    
-    with col2:
-        st.subheader("Quick Actions")
+        
         # Button to load selected question
-        if st.button("📝 Load Selected Question", type="primary", use_container_width=True):
+        if st.button("📝 Load Selected Question", use_container_width=True, key="load_selected"):
             user_id = st.session_state.user_id
             question_data = st.session_state.db.get_question(user_id, selected_question_id)
             if question_data:
@@ -287,17 +449,6 @@ def show_study_page():
                 st.session_state.current_question = question_data
                 st.session_state.last_grading_result = None
                 st.rerun()
-        
-        # Button to get next question via spaced repetition
-        if st.button("🔄 Get Next (Spaced Repetition)", use_container_width=True):
-            user_id = st.session_state.user_id
-            question_data = st.session_state.db.get_next_question_for_review(user_id)
-            if question_data:
-                st.session_state.current_question = question_data
-                st.session_state.last_grading_result = None
-                st.rerun()
-            else:
-                st.info("No questions due for review. Select a question manually above!")
     
     st.markdown("---")
     
@@ -445,7 +596,7 @@ def show_study_page():
                         st.session_state.last_grading_result = None
                         st.rerun()
                     else:
-                        st.info("No more questions due for review. Select a question manually above!")
+                        st.info("No more questions due for review. You can select a specific question from the expander above!")
             with col2:
                 if st.button("🔄 Select Another Question"):
                     st.session_state.current_question = None
@@ -453,7 +604,7 @@ def show_study_page():
                     st.rerun()
     
     else:
-        st.info("👆 Select a question above or click 'Get Next (Spaced Repetition)' to start studying!")
+        st.info("👆 Click 'Get Next Question' above to start studying, or select a specific question from the expander!")
 
 
 def show_progress_page():
@@ -579,6 +730,15 @@ def show_manage_questions_page():
         return
     
     st.metric("Total Questions", len(all_questions))
+    
+    # Database management section
+    with st.expander("🗑️ Clear All Questions", expanded=False):
+        st.warning("⚠️ This will delete ALL your questions and progress data!")
+        if st.button("🗑️ Clear All Questions", type="secondary", key="clear_all_questions"):
+            st.session_state.db.delete_all_questions(user_id)
+            st.success("✅ All questions deleted!")
+            st.rerun()
+    
     st.markdown("---")
     
     # Search/filter

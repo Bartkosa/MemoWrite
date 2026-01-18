@@ -53,8 +53,3 @@ Thumbs.db
 # Streamlit
 .streamlit/
 
-# Local testing guides (not needed in repo)
-LOCAL_TESTING.md
-SUPABASE_SETUP.md
-test_connection.py
-

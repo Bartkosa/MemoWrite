@@ -11,18 +11,23 @@ def get_gemini_api_key() -> str:
     """Get Gemini API key from Streamlit secrets or environment variables."""
     # Try Streamlit secrets first (for Streamlit Cloud)
     try:
-        if hasattr(st, 'secrets') and st.secrets:
-            api_key = st.secrets.get("GEMINI_API_KEY", "")
-            if api_key:
-                return api_key
-    except (AttributeError, KeyError, TypeError):
+        if hasattr(st, 'secrets'):
+            try:
+                api_key = st.secrets.get("GEMINI_API_KEY", "")
+                if api_key:
+                    return api_key
+            except (AttributeError, KeyError, TypeError, Exception):
+                # Streamlit not initialized or secrets not available
+                pass
+    except (AttributeError, Exception):
+        # Streamlit not available at all
         pass
     
     # Fallback to environment variables (for local development)
     return os.getenv("GEMINI_API_KEY", "")
 
 GEMINI_API_KEY = get_gemini_api_key()
-GEMINI_MODEL = "gemini-2.0-flash-exp"  # Using Gemini 2.0 Flash as specified
+GEMINI_MODEL = "gemini-2.5-pro"  # Best 2026 model: supports 1M token context window for entire PDF processing
 
 # Database Configuration
 # Try Streamlit secrets first, then environment variables
@@ -30,11 +35,16 @@ def get_database_url() -> str:
     """Get database URL from Streamlit secrets or environment variables."""
     # Try Streamlit secrets first (for Streamlit Cloud)
     try:
-        if hasattr(st, 'secrets') and st.secrets:
-            db_url = st.secrets.get("DATABASE_URL", "")
-            if db_url:
-                return db_url
-    except (AttributeError, KeyError, TypeError):
+        if hasattr(st, 'secrets'):
+            try:
+                db_url = st.secrets.get("DATABASE_URL", "")
+                if db_url:
+                    return db_url
+            except (AttributeError, KeyError, TypeError, Exception):
+                # Streamlit not initialized or secrets not available
+                pass
+    except (AttributeError, Exception):
+        # Streamlit not available at all
         pass
     
     # Fallback to environment variables (for local development)

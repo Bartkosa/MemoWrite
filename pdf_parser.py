@@ -1,15 +1,21 @@
 """PDF parsing module for extracting questions and answers from exam PDFs."""
-import pdfplumber
 import os
 import json
 import re
+import pathlib
+import time
+import logging
 import google.generativeai as genai
-from typing import List, Dict, Tuple
+from typing import List, Dict
 from config import GEMINI_API_KEY, GEMINI_MODEL, UPLOADS_DIR
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 
 class PDFParser:
-    """Parses PDF files to extract questions and answers."""
+    """Parses PDF files to extract questions and answers using Gemini API."""
     
     def __init__(self):
         """Initialize the PDF parser with Gemini API."""
@@ -26,598 +32,334 @@ class PDFParser:
             f.write(uploaded_file.getbuffer())
         return file_path
     
-    def extract_text_from_pdf(self, pdf_path: str) -> str:
-        """Extract all text from a PDF file."""
-        text = ""
-        try:
-            with pdfplumber.open(pdf_path) as pdf:
-                for page in pdf.pages:
-                    page_text = page.extract_text()
-                    if page_text:
-                        text += page_text + "\n"
-        except Exception as e:
-            raise Exception(f"Error extracting text from PDF: {str(e)}")
-        return text
-    
-    def _fix_text_spacing(self, text: str) -> str:
-        """Fix spacing issues in extracted text."""
-        if not text:
-            return text
-        
-        # Fix: add space between lowercase and uppercase (e.g., "HelloWorld" -> "Hello World")
-        text = re.sub(r'([a-z])([A-Z])', r'\1 \2', text)
-        
-        # Fix: add space after punctuation if missing (but not for decimals)
-        text = re.sub(r'([.!?])([A-Za-z])', r'\1 \2', text)
-        text = re.sub(r'([,;:])([A-Za-z])', r'\1 \2', text)
-        
-        # Fix: add space before opening parentheses/brackets if missing
-        text = re.sub(r'([A-Za-z0-9])(\()', r'\1 \2', text)
-        
-        # Normalize whitespace
-        text = re.sub(r'[ \t]+', ' ', text)
-        text = re.sub(r'\n\s*\n\s*\n+', '\n\n', text)
-        
-        # Clean up each line
-        lines = [line.strip() for line in text.split('\n')]
-        text = '\n'.join(lines)
-        
-        # Remove double spaces
-        while '  ' in text:
-            text = text.replace('  ', ' ')
-        
-        return text.strip()
-    
     def parse_with_gemini(self, pdf_path: str) -> List[Dict[str, str]]:
-        """Use Gemini API to parse PDF and extract Q&A pairs."""
+        """Use Gemini API to parse PDF and extract Q&A pairs.
+        
+        This method uploads the PDF file to Gemini and lets it extract Q&A pairs.
+        Includes detailed logging to identify bottlenecks.
+        
+        Args:
+            pdf_path: Path to the PDF file
+            
+        Returns:
+            List of dictionaries with 'question' and 'answer' keys
+        """
         if not self.model:
             raise Exception("Gemini API key not configured. Please set GEMINI_API_KEY in .env file.")
         
-        # Process page by page for better reliability
-        return self._parse_pdf_page_by_page(pdf_path)
-    
-    def _parse_pdf_page_by_page(self, pdf_path: str) -> List[Dict[str, str]]:
-        """Process PDF page by page to ensure all content is covered."""
-        all_qa_pairs = []
+        pdf_path_obj = pathlib.Path(pdf_path)
+        file_size = os.path.getsize(pdf_path) if os.path.exists(pdf_path) else 0
+        logger.info(f"Starting PDF parsing: {pdf_path_obj.name} ({file_size / 1024:.2f} KB)")
         
-        try:
-            with pdfplumber.open(pdf_path) as pdf:
-                total_pages = len(pdf.pages)
-                print(f"Processing PDF with {total_pages} pages...")
-                
-                # Process pages in batches to avoid token limits
-                # Group pages together (e.g., 3-5 pages per batch)
-                pages_per_batch = 3
-                
-                for batch_start in range(0, total_pages, pages_per_batch):
-                    batch_end = min(batch_start + pages_per_batch, total_pages)
-                    batch_pages = range(batch_start, batch_end)
-                    
-                    # Extract text from this batch of pages
-                    batch_text = ""
-                    for page_num in batch_pages:
-                        page = pdf.pages[page_num]
-                        page_text = page.extract_text()
-                        if page_text:
-                            batch_text += f"\n--- Page {page_num + 1} ---\n{page_text}\n"
-                    
-                    if not batch_text.strip():
-                        continue
-                    
-                    print(f"Processing pages {batch_start + 1}-{batch_end} ({len(batch_text)} chars)...")
-                    
-                    # Try delimiter method first
-                    batch_pairs = self._parse_with_delimiter_method(batch_text)
-                    
-                    # If that didn't work, try JSON method
-                    if not batch_pairs:
-                        batch_pairs = self._parse_with_json_method(batch_text)
-                    
-                    if batch_pairs:
-                        print(f"  Found {len(batch_pairs)} Q&A pairs in pages {batch_start + 1}-{batch_end}")
-                        all_qa_pairs.extend(batch_pairs)
-                    else:
-                        print(f"  No Q&A pairs found in pages {batch_start + 1}-{batch_end}")
-                
-        except Exception as e:
-            print(f"Error processing PDF page by page: {str(e)}")
-            # Fallback to full text extraction
-            pdf_text = self.extract_text_from_pdf(pdf_path)
-            return self._parse_with_delimiter_method(pdf_text) or self._parse_with_json_method(pdf_text)
-        
-        # Remove duplicates
-        seen = set()
-        unique_pairs = []
-        for pair in all_qa_pairs:
-            question_key = pair['question'].strip()[:150].lower()
-            if question_key not in seen:
-                seen.add(question_key)
-                unique_pairs.append(pair)
-        
-        print(f"Total unique Q&A pairs: {len(unique_pairs)}")
-        return unique_pairs
-    
-    def _parse_large_pdf_in_chunks(self, pdf_text: str, chunk_size: int) -> List[Dict[str, str]]:
-        """Process large PDFs in chunks to avoid token limits."""
-        all_qa_pairs = []
-        
-        # Split text into chunks with overlap to avoid cutting questions/answers in half
-        overlap_size = 10000  # Increased overlap to ensure we don't split Q&A pairs
-        chunks = []
-        
-        start = 0
-        while start < len(pdf_text):
-            end = start + chunk_size
-            chunk = pdf_text[start:end]
-            
-            # Try to break at a good point to avoid cutting questions/answers
-            if end < len(pdf_text):
-                # Look for a good break point (paragraph break, question marker, etc.)
-                # Try to find a question number or clear separator
-                break_point = -1
-                
-                # Look for question markers near the end
-                for marker in ['\n\nQuestion', '\n\nQ', '\n\n1.', '\n\n2.', '\n\n3.', '\n\n4.', '\n\n5.']:
-                    pos = chunk.rfind(marker)
-                    if pos > chunk_size * 0.7:  # If found in last 30%
-                        break_point = pos
-                        break
-                
-                # If no question marker, try paragraph break
-                if break_point == -1:
-                    break_point = chunk.rfind('\n\n')
-                
-                # If still nothing, try single newline
-                if break_point == -1:
-                    break_point = chunk.rfind('\n')
-                
-                # If still nothing, try sentence end
-                if break_point == -1:
-                    break_point = chunk.rfind('. ')
-                
-                if break_point > chunk_size * 0.7:  # Only use if it's in the last 30%
-                    chunk = chunk[:break_point + 1]
-                    end = start + break_point + 1
-            
-            chunks.append((start, end, chunk))
-            start = end - overlap_size  # Overlap with next chunk
-        
-        print(f"Processing PDF in {len(chunks)} chunks...")
-        
-        # Process each chunk
-        for i, (chunk_start, chunk_end, chunk_text) in enumerate(chunks):
-            try:
-                print(f"Processing chunk {i+1}/{len(chunks)} (chars {chunk_start}-{chunk_end})...")
-                
-                # Try delimiter method first
-                chunk_pairs = self._parse_with_delimiter_method(chunk_text)
-                
-                # If that didn't work, try JSON method
-                if not chunk_pairs:
-                    chunk_pairs = self._parse_with_json_method(chunk_text)
-                
-                # Add chunk info for debugging
-                if chunk_pairs:
-                    print(f"  Found {len(chunk_pairs)} Q&A pairs in chunk {i+1}")
-                    all_qa_pairs.extend(chunk_pairs)
-                else:
-                    print(f"  No Q&A pairs found in chunk {i+1}")
-                    
-            except Exception as e:
-                # Continue with next chunk if one fails
-                print(f"Warning: Error processing chunk {i+1}/{len(chunks)}: {str(e)}")
-                continue
-        
-        print(f"Total Q&A pairs found: {len(all_qa_pairs)}")
-        
-        # Remove duplicates (might occur due to overlap)
-        seen = set()
-        unique_pairs = []
-        for pair in all_qa_pairs:
-            # Use question text as key for deduplication (first 150 chars)
-            question_key = pair['question'].strip()[:150].lower()
-            if question_key not in seen:
-                seen.add(question_key)
-                unique_pairs.append(pair)
-        
-        print(f"After deduplication: {len(unique_pairs)} unique Q&A pairs")
-        
-        return unique_pairs
-    
-    def _parse_with_delimiter_method(self, pdf_text: str) -> List[Dict[str, str]]:
-        """Parse using delimiter-based format - more reliable than JSON."""
-        # Don't truncate here - let the chunking handle large PDFs
-        # But still limit for single requests
-        max_text_length = 200000
-        if len(pdf_text) > max_text_length:
-            pdf_text = pdf_text[:max_text_length] + "\n[... text truncated ...]"
-        
-        prompt = f"""You are extracting question-answer pairs from an exam document.
+        prompt = """Extract ALL question-answer pairs from this PDF document.
 
-CRITICAL: Extract EVERY question-answer pair you can find. Do not skip any.
-
-For each question-answer pair, format it EXACTLY like this:
-
-===QUESTION===
-[the complete question text here]
-===ANSWER===
-[the complete answer/solution text here]
-===
-
-Repeat this format for EVERY question-answer pair in the document.
-
-IMPORTANT RULES:
-1. Extract ALL questions - do not skip any, even if they seem similar
+CRITICAL REQUIREMENTS:
+1. Extract EVERY question-answer pair you can find in the document
 2. Only include pairs where BOTH question AND answer exist
-3. Preserve all text exactly as it appears, including formatting
-4. Use the exact delimiters: ===QUESTION=== and ===ANSWER===
-5. Separate each pair with ===
-6. If a question spans multiple lines, include all lines
-7. If an answer spans multiple paragraphs, include all paragraphs
+3. Preserve all text, but fix spacing issues and formatting
+4. Return ONLY valid JSON, no markdown, no explanations
+5. Escape all special characters properly in JSON (use \\n for newlines, \\" for quotes)
+6. Ensure the JSON is complete and properly closed
 
-Document content:
-{pdf_text}
+Return a JSON object with this exact structure:
+{
+  "qa_pairs": [
+    {
+      "question": "complete question text here",
+      "answer": "complete answer/solution text here"
+    }
+  ]
+}
 
-Now extract ALL question-answer pairs:"""
-
-        try:
-            response = self.model.generate_content(
-                prompt,
-                generation_config={
-                    "temperature": 0.1,
-                    "max_output_tokens": 32768,  # Maximum for Gemini 2.0 Flash
-                }
-            )
-            response_text = response.text.strip()
-            
-            if not response_text:
-                return []
-            
-            # Parse delimiter-based format using regex (more reliable)
-            import re
-            qa_pairs = []
-            
-            # Primary pattern: ===QUESTION=== ... ===ANSWER=== ... ===
-            pattern = r'===QUESTION===\s*(.*?)\s*===ANSWER===\s*(.*?)\s*==='
-            matches = re.finditer(pattern, response_text, re.DOTALL | re.IGNORECASE)
-            
-            for match in matches:
-                question = match.group(1).strip()
-                answer = match.group(2).strip()
-                if question and answer:
-                    # Fix spacing issues
-                    question = self._fix_text_spacing(question)
-                    answer = self._fix_text_spacing(answer)
-                    qa_pairs.append({
-                        "question": question,
-                        "answer": answer
-                    })
-            
-            # Alternative pattern if the first one doesn't match (variations)
-            if not qa_pairs:
-                # Try without the final === separator
-                pattern2 = r'===QUESTION===\s*(.*?)\s*===ANSWER===\s*(.*?)(?=\s*===QUESTION===|\Z)'
-                matches2 = re.finditer(pattern2, response_text, re.DOTALL | re.IGNORECASE)
-                for match in matches2:
-                    question = match.group(1).strip()
-                    answer = match.group(2).strip()
-                    if question and answer:
-                        # Fix spacing issues
-                        question = self._fix_text_spacing(question)
-                        answer = self._fix_text_spacing(answer)
-                        qa_pairs.append({
-                            "question": question,
-                            "answer": answer
-                        })
-            
-            return qa_pairs if qa_pairs else []
-            
-        except Exception as e:
-            return []  # Return empty, will try JSON method
-    
-    def _parse_with_json_method(self, pdf_text: str) -> List[Dict[str, str]]:
-        """Fallback JSON parsing method."""
-        # Don't truncate here - let the chunking handle large PDFs
-        max_text_length = 200000
-        if len(pdf_text) > max_text_length:
-            pdf_text = pdf_text[:max_text_length] + "\n[... text truncated ...]"
-        
-        prompt = f"""Extract all question-answer pairs from this exam document.
-
-Return a JSON array. Each object must have:
-- "question": (string) the question text
-- "answer": (string) the answer text
-
-Only include pairs where both question AND answer exist.
-Escape special characters properly in JSON (\\n for newlines, \\" for quotes).
-
-Document:
-{pdf_text}
-
-Return JSON array:"""
+IMPORTANT: Make sure all newlines in text are escaped as \\n in the JSON strings.
+Extract all pairs now and return ONLY the JSON:"""
 
         try:
+            # Step 1: Upload PDF file to Gemini
+            upload_start = time.time()
+            print(f"[Step 1/5] Uploading PDF file to Gemini... ({file_size / 1024:.2f} KB)")
+            logger.info("Step 1: Uploading PDF file to Gemini...")
+            uploaded_file = genai.upload_file(path=str(pdf_path_obj), mime_type='application/pdf')
+            upload_time = time.time() - upload_start
+            print(f"[Step 1/5] ✓ Upload completed in {upload_time:.2f}s. File ID: {uploaded_file.name[:20]}...")
+            logger.info(f"✓ File upload initiated in {upload_time:.2f}s. File ID: {uploaded_file.name}")
+            
+            # Step 2: Wait for file to be processed
+            processing_start = time.time()
+            print(f"[Step 2/5] Waiting for Gemini to process the file... (current state: {uploaded_file.state.name})")
+            logger.info(f"Step 2: Waiting for Gemini to process the file... (state: {uploaded_file.state.name})")
+            poll_count = 0
+            initial_state = uploaded_file.state.name
+            
+            while uploaded_file.state.name == "PROCESSING":
+                poll_count += 1
+                time.sleep(2)
+                uploaded_file = genai.get_file(uploaded_file.name)
+                if poll_count % 5 == 0:  # Log every 10 seconds
+                    elapsed = time.time() - processing_start
+                    print(f"[Step 2/5] Still processing... ({elapsed:.1f}s elapsed, {poll_count} polls)")
+                    logger.info(f"  Still processing... ({elapsed:.1f}s elapsed)")
+            
+            processing_time = time.time() - processing_start
+            final_state = uploaded_file.state.name
+            if initial_state != "PROCESSING":
+                print(f"[Step 2/5] ✓ File was already processed (state: {initial_state} → {final_state}) in {processing_time:.2f}s")
+            else:
+                print(f"[Step 2/5] ✓ Processing completed in {processing_time:.2f}s ({poll_count} polls, state: {final_state})")
+            logger.info(f"✓ File processing completed in {processing_time:.2f}s ({poll_count} polls, state: {final_state})")
+            
+            if uploaded_file.state.name == "FAILED":
+                raise Exception(f"File upload failed: {uploaded_file.state}")
+            
+            # Step 3: Generate content using the uploaded PDF
+            generation_start = time.time()
+            print(f"[Step 3/5] Sending prompt to Gemini for Q&A extraction...")
+            logger.info("Step 3: Sending prompt to Gemini for Q&A extraction...")
+            contents = [uploaded_file, prompt]
             response = self.model.generate_content(
-                prompt,
+                contents,
                 generation_config={
                     "temperature": 0.1,
-                    "max_output_tokens": 32768,  # Maximum for Gemini 2.0 Flash
+                    "max_output_tokens": 32768,
                 }
             )
-            response_text = response.text.strip()
+            generation_time = time.time() - generation_start
+            response_length = len(response.text) if response.text else 0
+            print(f"[Step 3/5] ✓ Response received in {generation_time:.2f}s ({response_length:,} characters)")
+            logger.info(f"✓ Gemini response received in {generation_time:.2f}s ({response_length} characters)")
             
-            if not response_text:
-                return []
-            
-            # Extract JSON
-            json_text = self._extract_json_from_response(response_text)
-            
-            # Try to parse
+            # Step 4: Clean up uploaded file
+            cleanup_start = time.time()
+            print(f"[Step 4/5] Cleaning up uploaded file...")
+            logger.info("Step 4: Cleaning up uploaded file...")
+            cleanup_time = 0
             try:
-                qa_pairs = json.loads(json_text)
-            except json.JSONDecodeError:
-                qa_pairs = self._parse_json_manually(json_text)
-                if not qa_pairs:
-                    qa_pairs = self._parse_structured_text(response_text)
+                genai.delete_file(uploaded_file.name)
+                cleanup_time = time.time() - cleanup_start
+                print(f"[Step 4/5] ✓ Cleanup completed in {cleanup_time:.2f}s")
+                logger.info(f"✓ File cleanup completed in {cleanup_time:.2f}s")
+            except Exception as e:
+                cleanup_time = time.time() - cleanup_start
+                print(f"[Step 4/5] ⚠ Cleanup failed: {str(e)}")
+                logger.warning(f"⚠ File cleanup failed: {str(e)}")
             
-            # Validate
-            if isinstance(qa_pairs, dict):
-                qa_pairs = [qa_pairs]
+            # Step 5: Parse response
+            parsing_start = time.time()
+            print(f"[Step 5/5] Parsing JSON response...")
+            logger.info("Step 5: Parsing JSON response...")
             
+            response_text = response.text.strip()
+            # Debug: Show first 500 chars of response
+            print(f"[DEBUG] Response preview (first 500 chars): {response_text[:500]}...")
+            logger.debug(f"Response preview: {response_text[:500]}")
+            
+            # Extract JSON from response (handle markdown code blocks)
+            if "```" in response_text:
+                # Try to extract JSON from code blocks
+                json_matches = re.findall(r'```(?:json)?\s*(\{[\s\S]*?\})\s*```', response_text, re.DOTALL)
+                if json_matches:
+                    response_text = json_matches[0]
+                else:
+                    # Try without closing backticks (incomplete response)
+                    json_matches = re.findall(r'```(?:json)?\s*(\{[\s\S]*)', response_text, re.DOTALL)
+                    if json_matches:
+                        response_text = json_matches[0]
+            
+            # Extract JSON object - find the first { and try to match to the end
+            json_start = response_text.find('{')
+            if json_start != -1:
+                json_text = response_text[json_start:]
+                
+                # Try to find the matching closing brace
+                # Count braces to find the end
+                brace_count = 0
+                in_string = False
+                escape_next = False
+                json_end = -1
+                
+                for i, char in enumerate(json_text):
+                    if escape_next:
+                        escape_next = False
+                        continue
+                    if char == '\\':
+                        escape_next = True
+                        continue
+                    if char == '"' and not escape_next:
+                        in_string = not in_string
+                        continue
+                    if not in_string:
+                        if char == '{':
+                            brace_count += 1
+                        elif char == '}':
+                            brace_count -= 1
+                            if brace_count == 0:
+                                json_end = i + 1
+                                break
+                
+                if json_end > 0:
+                    json_text = json_text[:json_end]
+                # If we couldn't find the end, try to fix incomplete JSON
+                elif json_text.count('{') > json_text.count('}'):
+                    # Missing closing braces - try to complete it
+                    missing_braces = json_text.count('{') - json_text.count('}')
+                    # Try to extract what we can
+                    json_text = json_text.rstrip() + '}' * missing_braces
+            else:
+                json_text = response_text
+            
+            # Try to fix common JSON issues before parsing
+            # Replace unescaped newlines in string values (but be careful)
+            # This is a simplified approach - we'll try parsing first
+            
+            # Parse JSON
+            result = None
+            json_error = None
+            try:
+                result = json.loads(json_text)
+            except json.JSONDecodeError as e:
+                json_error = str(e)
+                # Try to fix unescaped newlines in string values
+                # This regex finds string values and escapes newlines
+                def fix_newlines(match):
+                    content = match.group(1)
+                    # Only fix if it's not already escaped
+                    if '\n' in content and '\\n' not in content:
+                        content = content.replace('\n', '\\n').replace('\r', '\\r')
+                    return f'"{content}"'
+                
+                # Try to fix string values with unescaped newlines
+                try:
+                    # Pattern: "..." where ... might contain unescaped newlines
+                    fixed_json = re.sub(r'"([^"\\]*(?:\\.[^"\\]*)*)"', fix_newlines, json_text)
+                    result = json.loads(fixed_json)
+                except:
+                    # If that didn't work, try a simpler approach - just try to extract pairs manually
+                    qa_pairs = self._extract_pairs_from_text(response_text)
+                    if qa_pairs:
+                        return qa_pairs
+                    raise Exception(f"Failed to parse JSON response from Gemini. Error: {json_error}. Response preview: {response_text[:1000]}")
+            
+            if result is None:
+                raise Exception(f"Failed to parse JSON response from Gemini. Response preview: {response_text[:1000]}")
+            
+            # Extract qa_pairs from result
+            qa_pairs = []
+            if isinstance(result, dict):
+                pairs = result.get("qa_pairs", result.get("questions", result.get("pairs", [])))
+                if not pairs and isinstance(result, list):
+                    pairs = result
+            elif isinstance(result, list):
+                pairs = result
+            else:
+                pairs = []
+            
+            # Validate and format pairs
             validated_pairs = []
-            for pair in qa_pairs:
+            for pair in pairs:
                 if isinstance(pair, dict):
                     question = str(pair.get("question", "")).strip()
                     answer = str(pair.get("answer", "")).strip()
                     if question and answer:
-                        # Fix spacing issues
-                        question = self._fix_text_spacing(question)
-                        answer = self._fix_text_spacing(answer)
                         validated_pairs.append({
                             "question": question,
                             "answer": answer
                         })
             
+            parsing_time = time.time() - parsing_start
+            total_time = time.time() - upload_start
+            print(f"[Step 5/5] ✓ Parsing completed in {parsing_time:.2f}s. Found {len(validated_pairs)} Q&A pairs")
+            print(f"\n{'='*70}")
+            print(f"PERFORMANCE SUMMARY")
+            print(f"{'='*70}")
+            print(f"Total time: {total_time:.2f}s")
+            print(f"  • Upload:      {upload_time:.2f}s ({upload_time/total_time*100:.1f}%)")
+            print(f"  • Processing:   {processing_time:.2f}s ({processing_time/total_time*100:.1f}%)")
+            print(f"  • Generation:   {generation_time:.2f}s ({generation_time/total_time*100:.1f}%)")
+            print(f"  • Cleanup:      {cleanup_time:.2f}s ({cleanup_time/total_time*100:.1f}%)")
+            print(f"  • Parsing:      {parsing_time:.2f}s ({parsing_time/total_time*100:.1f}%)")
+            print(f"{'='*70}\n")
+            logger.info(f"✓ Parsing completed in {parsing_time:.2f}s. Found {len(validated_pairs)} Q&A pairs")
+            logger.info(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+            logger.info(f"Total processing time: {total_time:.2f}s")
+            logger.info(f"  - Upload: {upload_time:.2f}s ({upload_time/total_time*100:.1f}%)")
+            logger.info(f"  - Processing: {processing_time:.2f}s ({processing_time/total_time*100:.1f}%)")
+            logger.info(f"  - Generation: {generation_time:.2f}s ({generation_time/total_time*100:.1f}%)")
+            logger.info(f"  - Parsing: {parsing_time:.2f}s ({parsing_time/total_time*100:.1f}%)")
+            logger.info(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+            
             return validated_pairs
             
         except Exception as e:
-            raise Exception(f"Error parsing PDF: {str(e)}")
+            logger.error(f"❌ Error parsing PDF: {str(e)}")
+            raise Exception(f"Error parsing PDF with Gemini: {str(e)}")
     
-    def _extract_json_from_response(self, response_text: str) -> str:
-        """Extract JSON from Gemini response, handling various formats."""
-        import re
-        
-        # Remove markdown code blocks
-        if "```" in response_text:
-            # Extract content between code blocks
-            matches = re.findall(r'```(?:json)?\s*(.*?)```', response_text, re.DOTALL)
-            if matches:
-                return matches[0].strip()
-        
-        # Try to find JSON array pattern - be more specific
-        # Look for [ followed by content and ending with ]
-        json_match = re.search(r'(\[[\s\S]*\])', response_text, re.DOTALL)
-        if json_match:
-            return json_match.group(1)
-        
-        # Try to find just the array content if brackets are missing
-        # Look for patterns like {"question":..., "answer":...}
-        obj_pattern = r'\{[^}]*"question"[^}]*"answer"[^}]*\}'
-        if re.search(obj_pattern, response_text):
-            # Wrap in array
-            return '[' + response_text + ']'
-        
-        # If no clear JSON found, return the whole response
-        return response_text.strip()
-    
-    def _fix_json_issues(self, json_text: str) -> str:
-        """Try to fix common JSON formatting issues."""
-        import re
-        
-        # Remove any leading/trailing whitespace
-        json_text = json_text.strip()
-        
-        # Ensure it starts with [ and ends with ]
-        if not json_text.startswith('['):
-            # Try to find the start
-            start_idx = json_text.find('[')
-            if start_idx != -1:
-                json_text = json_text[start_idx:]
-        
-        if not json_text.endswith(']'):
-            # Try to find the end
-            end_idx = json_text.rfind(']')
-            if end_idx != -1:
-                json_text = json_text[:end_idx + 1]
-        
-        # Try to fix unescaped newlines within string values
-        # This is a simplified approach - find string values and escape newlines
-        # Pattern: "..." where ... might contain unescaped newlines
-        def escape_string_content(match):
-            content = match.group(1)
-            # Escape newlines, quotes, and backslashes
-            content = content.replace('\\', '\\\\')  # Escape backslashes first
-            content = content.replace('"', '\\"')   # Escape quotes
-            content = content.replace('\n', '\\n')   # Escape newlines
-            content = content.replace('\r', '\\r')   # Escape carriage returns
-            content = content.replace('\t', '\\t')   # Escape tabs
-            return f'"{content}"'
-        
-        # This is complex - instead, let's try a simpler approach
-        # Use json.JSONDecoder with strict=False if available, or try manual repair
-        
-        return json_text
-    
-    def _parse_json_manually(self, json_text: str) -> List[Dict[str, str]]:
-        """Manually parse JSON-like text when standard parsing fails."""
-        import re
-        
+    def _extract_pairs_from_text(self, text: str) -> List[Dict[str, str]]:
+        """Fallback method to extract Q&A pairs from text when JSON parsing fails."""
         qa_pairs = []
         
-        # Try to find JSON objects with question and answer fields
-        # Pattern: {"question": "...", "answer": "..."}
-        pattern = r'\{\s*"question"\s*:\s*"((?:[^"\\]|\\.)*)"\s*,\s*"answer"\s*:\s*"((?:[^"\\]|\\.)*)"\s*\}'
-        matches = re.finditer(pattern, json_text, re.DOTALL)
+        # Try multiple patterns to extract Q&A pairs
+        
+        # Pattern 1: Standard JSON format {"question": "...", "answer": "..."}
+        # Handle both escaped and unescaped newlines
+        pattern1 = r'"question"\s*:\s*"((?:[^"\\]|\\.|\\n|\n)*?)"\s*,\s*"answer"\s*:\s*"((?:[^"\\]|\\.|\\n|\n)*?)"'
+        matches = re.finditer(pattern1, text, re.DOTALL)
         
         for match in matches:
             question = match.group(1)
             answer = match.group(2)
-            # Unescape JSON escape sequences
+            # Handle both escaped and unescaped newlines
             question = question.replace('\\n', '\n').replace('\\"', '"').replace('\\\\', '\\')
             answer = answer.replace('\\n', '\n').replace('\\"', '"').replace('\\\\', '\\')
             
-            if question.strip():
+            if question.strip() and answer.strip():
                 qa_pairs.append({
                     "question": question.strip(),
                     "answer": answer.strip()
                 })
         
-        return qa_pairs
-    
-    def _parse_structured_text(self, text: str) -> List[Dict[str, str]]:
-        """Fallback: Parse structured text format if JSON fails."""
-        import re
+        # If we found pairs, return them
+        if qa_pairs:
+            return qa_pairs
         
-        qa_pairs = []
+        # Pattern 2: Try to extract from incomplete JSON (truncated response)
+        # Look for question fields even if answer is incomplete
+        pattern2 = r'"question"\s*:\s*"((?:[^"\\]|\\.|\\n|\n)*?)"'
+        question_matches = list(re.finditer(pattern2, text, re.DOTALL))
         
-        # Try to find patterns like "Question: ... Answer: ..."
-        pattern = r'(?:Question|Q)[\s:]*([^\n]+(?:\n(?!Answer|Q)[^\n]+)*)[\s\n]*(?:Answer|A)[\s:]*([^\n]+(?:\n(?!Question|Q)[^\n]+)*)'
-        matches = re.finditer(pattern, text, re.IGNORECASE | re.MULTILINE | re.DOTALL)
-        
-        for match in matches:
-            question = match.group(1).strip()
-            answer = match.group(2).strip()
-            if question and answer:
-                qa_pairs.append({
-                    "question": question,
-                    "answer": answer
-                })
-        
-        # If no matches, try numbered format
-        if not qa_pairs:
-            # Pattern for "1. Question text\nAnswer: ..."
-            pattern2 = r'\d+[\.\)]\s*([^\n]+(?:\n(?!\d+[\.\)]|Answer)[^\n]+)*)[\s\n]*(?:Answer|Solution)[\s:]*([^\n]+(?:\n(?!\d+[\.\)])[^\n]+)*)'
-            matches2 = re.finditer(pattern2, text, re.IGNORECASE | re.MULTILINE | re.DOTALL)
+        # Try to find corresponding answers
+        for i, q_match in enumerate(question_matches):
+            question = q_match.group(1).replace('\\n', '\n').replace('\\"', '"').replace('\\\\', '\\')
             
-            for match in matches2:
-                question = match.group(1).strip()
-                answer = match.group(2).strip()
-                if question and answer:
+            # Look for answer after this question
+            search_start = q_match.end()
+            answer_pattern = r'"answer"\s*:\s*"((?:[^"\\]|\\.|\\n|\n)*?)"'
+            answer_match = re.search(answer_pattern, text[search_start:], re.DOTALL)
+            
+            if answer_match:
+                answer = answer_match.group(1).replace('\\n', '\n').replace('\\"', '"').replace('\\\\', '\\')
+                if question.strip() and answer.strip():
                     qa_pairs.append({
-                        "question": question,
-                        "answer": answer
+                        "question": question.strip(),
+                        "answer": answer.strip()
                     })
-        
-        return qa_pairs if qa_pairs else []
-    
-    def _parse_with_alternative_method(self, pdf_text: str) -> List[Dict[str, str]]:
-        """Alternative parsing method using a simpler format request."""
-        # Use a delimiter-based format that's easier to parse
-        prompt = f"""Extract all question-answer pairs from this document.
-
-For each pair, format it as:
-QUESTION_START
-[question text here]
-QUESTION_END
-ANSWER_START
-[answer text here]
-ANSWER_END
-
-Repeat for all pairs found.
-
-Document:
-{pdf_text[:100000]}
-
-Extract all pairs now:"""
-        
-        try:
-            response = self.model.generate_content(prompt)
-            response_text = response.text.strip()
-            
-            # Parse the delimiter-based format
-            qa_pairs = []
-            parts = response_text.split("QUESTION_START")
-            
-            for part in parts[1:]:  # Skip first empty part
-                if "QUESTION_END" in part and "ANSWER_START" in part and "ANSWER_END" in part:
-                    question = part.split("QUESTION_END")[0].strip()
-                    answer_part = part.split("ANSWER_START")[1]
-                    answer = answer_part.split("ANSWER_END")[0].strip()
+            else:
+                # Answer might be incomplete - try to extract what we can
+                # Look for "answer": " and take everything until end or next question
+                answer_start = text.find('"answer": "', search_start)
+                if answer_start != -1:
+                    answer_start += len('"answer": "')
+                    # Find next question or end of text
+                    next_question = text.find('"question":', answer_start)
+                    if next_question != -1:
+                        answer_text = text[answer_start:next_question].rstrip().rstrip('"').rstrip(',')
+                    else:
+                        answer_text = text[answer_start:].rstrip().rstrip('"').rstrip(',')
                     
-                    if question and answer:
+                    answer = answer_text.replace('\\n', '\n').replace('\\"', '"').replace('\\\\', '\\')
+                    if question.strip() and answer.strip():
                         qa_pairs.append({
-                            "question": question,
-                            "answer": answer
+                            "question": question.strip(),
+                            "answer": answer.strip()
                         })
-            
-            return qa_pairs if qa_pairs else []
-        except Exception:
-            return []
-    
-    def parse_pdf(self, pdf_path: str, use_gemini: bool = True) -> List[Dict[str, str]]:
-        """Parse PDF and extract Q&A pairs.
-        
-        Args:
-            pdf_path: Path to the PDF file
-            use_gemini: Whether to use Gemini API for parsing (recommended)
-        
-        Returns:
-            List of dictionaries with 'question' and 'answer' keys
-        """
-        if use_gemini and self.model:
-            return self.parse_with_gemini(pdf_path)
-        else:
-            # Fallback to simple text extraction and pattern matching
-            return self._parse_with_patterns(pdf_path)
-    
-    def _parse_with_patterns(self, pdf_path: str) -> List[Dict[str, str]]:
-        """Fallback parsing method using pattern matching."""
-        text = self.extract_text_from_pdf(pdf_path)
-        
-        # Simple pattern matching for Q&A pairs
-        # This is a basic implementation - can be improved
-        qa_pairs = []
-        lines = text.split('\n')
-        
-        current_question = None
-        current_answer = []
-        in_answer = False
-        
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
-            
-            # Detect question markers
-            if any(marker in line.lower() for marker in ['question', 'q:', 'q.', '?']):
-                if current_question and current_answer:
-                    qa_pairs.append({
-                        "question": current_question,
-                        "answer": " ".join(current_answer)
-                    })
-                current_question = line
-                current_answer = []
-                in_answer = False
-            # Detect answer markers
-            elif any(marker in line.lower() for marker in ['answer', 'a:', 'a.', 'solution']):
-                in_answer = True
-                if line.lower().startswith(('answer', 'a:', 'a.')):
-                    answer_text = line.split(':', 1)[-1].strip() if ':' in line else line
-                    if answer_text:
-                        current_answer.append(answer_text)
-            elif in_answer:
-                current_answer.append(line)
-            elif not current_question:
-                # Might be a question without explicit marker
-                if '?' in line:
-                    current_question = line
-        
-        # Add last pair
-        if current_question and current_answer:
-            qa_pairs.append({
-                "question": current_question,
-                "answer": " ".join(current_answer)
-            })
         
         return qa_pairs
-

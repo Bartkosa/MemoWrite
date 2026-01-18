@@ -23,10 +23,15 @@ def get_client_config() -> dict:
     
     # Try to get from Streamlit secrets first
     try:
-        if hasattr(st, 'secrets') and st.secrets:
-            client_id = st.secrets.get("GOOGLE_CLIENT_ID", "")
-            client_secret = st.secrets.get("GOOGLE_CLIENT_SECRET", "")
-    except (AttributeError, KeyError, TypeError):
+        if hasattr(st, 'secrets'):
+            try:
+                client_id = st.secrets.get("GOOGLE_CLIENT_ID", "")
+                client_secret = st.secrets.get("GOOGLE_CLIENT_SECRET", "")
+            except (AttributeError, KeyError, TypeError, Exception):
+                # Streamlit not initialized or secrets not available
+                pass
+    except (AttributeError, Exception):
+        # Streamlit not available at all
         pass
     
     # Fallback to environment variables
@@ -59,11 +64,16 @@ def get_redirect_uri() -> str:
     """Get the redirect URI based on the current environment."""
     # First, try to get from Streamlit secrets (most reliable - user can set it explicitly)
     try:
-        if hasattr(st, 'secrets') and st.secrets:
-            redirect_uri = st.secrets.get("REDIRECT_URI", "")
-            if redirect_uri:
-                return redirect_uri
-    except (AttributeError, KeyError, TypeError):
+        if hasattr(st, 'secrets'):
+            try:
+                redirect_uri = st.secrets.get("REDIRECT_URI", "")
+                if redirect_uri:
+                    return redirect_uri
+            except (AttributeError, KeyError, TypeError, Exception):
+                # Streamlit not initialized or secrets not available
+                pass
+    except (AttributeError, Exception):
+        # Streamlit not available at all
         pass
     
     # Check environment variable (set by Streamlit Cloud)
