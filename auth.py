@@ -7,6 +7,7 @@ import json
 from typing import Optional, Dict
 import pickle
 from pathlib import Path
+import uuid
 
 
 SCOPES = ["openid", "https://www.googleapis.com/auth/userinfo.email", "https://www.googleapis.com/auth/userinfo.profile"]
@@ -210,6 +211,90 @@ def clear_last_user_email():
         print(f"Warning: Failed to clear last user email: {str(e)}")
 
 
+def get_or_create_device_id() -> str:
+    """Get or create a device ID from query parameters.
+    
+    If device_id exists in query params, return it.
+    If not, generate a new UUID and add it to query params.
+    
+    Returns:
+        Device ID string
+    """
+    query_params = st.query_params
+    device_id = query_params.get('device_id', '')
+    
+    if not device_id:
+        # Generate a new device ID
+        device_id = str(uuid.uuid4())
+        # Add to query parameters
+        query_params['device_id'] = device_id
+        st.query_params = query_params
+    
+    return device_id
+
+
+def get_device_auth_file(device_id: str) -> Path:
+    """Get the file path for storing device-specific authentication.
+    
+    Args:
+        device_id: Unique device identifier
+        
+    Returns:
+        Path to device-specific auth file
+    """
+    return CREDENTIALS_DIR / f".device_{device_id}.txt"
+
+
+def save_device_auth(device_id: str, email: str):
+    """Save the authenticated user's email for a specific device.
+    
+    Args:
+        device_id: Unique device identifier
+        email: User's email address
+    """
+    try:
+        device_auth_file = get_device_auth_file(device_id)
+        with open(device_auth_file, 'w') as f:
+            f.write(email)
+    except Exception as e:
+        print(f"Warning: Failed to save device auth: {str(e)}")
+
+
+def load_device_auth(device_id: str) -> Optional[str]:
+    """Load the authenticated user's email for a specific device.
+    
+    Args:
+        device_id: Unique device identifier
+        
+    Returns:
+        User's email if found, None otherwise
+    """
+    try:
+        device_auth_file = get_device_auth_file(device_id)
+        if device_auth_file.exists():
+            with open(device_auth_file, 'r') as f:
+                email = f.read().strip()
+                if email:
+                    return email
+    except Exception as e:
+        print(f"Warning: Failed to load device auth: {str(e)}")
+    return None
+
+
+def clear_device_auth(device_id: str):
+    """Clear the device-specific authentication file.
+    
+    Args:
+        device_id: Unique device identifier
+    """
+    try:
+        device_auth_file = get_device_auth_file(device_id)
+        if device_auth_file.exists():
+            device_auth_file.unlink()
+    except Exception as e:
+        print(f"Warning: Failed to clear device auth: {str(e)}")
+
+
 def refresh_credentials_if_needed(credentials):
     """Refresh OAuth credentials if they are expired or about to expire."""
     if credentials.expired and credentials.refresh_token:
@@ -230,11 +315,17 @@ def init_session_state():
         st.session_state.user_info = None
     if 'user_id' not in st.session_state:
         st.session_state.user_id = None
+    if 'device_id' not in st.session_state:
+        st.session_state.device_id = None
 
 
 def check_authentication() -> bool:
     """Check if user is authenticated. Returns True if authenticated."""
     init_session_state()
+    
+    # Get or create device ID (ensures it's in query params for persistence)
+    device_id = get_or_create_device_id()
+    st.session_state.device_id = device_id
     
     # Check if we have valid credentials in session state
     if st.session_state.get('authenticated') and st.session_state.get('user_info'):
@@ -268,25 +359,30 @@ def check_authentication() -> bool:
             
             # Save to file for persistence
             save_credentials(user_email, credentials, user_info)
-            # Note: We don't save to shared .last_user.txt to prevent cross-device login issues
-            # Each browser session uses its own session state which persists across page refreshes
+            # Save device-specific authentication (persists across page refreshes)
+            save_device_auth(device_id, user_email)
             
-            # Clear the code from URL
-            st.query_params.clear()
+            # Clear the code from URL (but keep device_id)
+            query_params.pop('code', None)
+            st.query_params = query_params
             st.rerun()
             
         except Exception as e:
             st.error(f"Authentication error: {str(e)}")
             return False
     
-    # If not authenticated in session state, try loading from file
-    # SECURITY: Only use session state to identify which user's credentials to load
-    # This ensures each device/browser session is independent
-    # Session state persists across page refreshes within the same browser session
+    # If not authenticated in session state, try loading from device-specific file
+    # This allows persistence across page refreshes while maintaining device independence
     if not st.session_state.get('authenticated'):
-        # Only use email from session state (device/browser-specific)
-        # Do NOT load from shared file as it would cause cross-device login issues
+        # First try session state (for same browser session)
         stored_email = st.session_state.get('last_authenticated_email')
+        
+        # If not in session state, try loading from device-specific file
+        if not stored_email:
+            stored_email = load_device_auth(device_id)
+            if stored_email:
+                # Restore to session state for this session
+                st.session_state.last_authenticated_email = stored_email
         
         if stored_email:
             # We know which user's credentials to load
@@ -315,12 +411,15 @@ def check_authentication() -> bool:
                                 # Credentials are invalid, remove the file
                                 print(f"Credentials invalid, removing file: {str(e)}")
                                 delete_credentials_file(stored_email)
+                                # Clear device auth if credentials are invalid
+                                clear_device_auth(device_id)
                                 # Clear session state
                                 if 'last_authenticated_email' in st.session_state:
                                     del st.session_state['last_authenticated_email']
                     else:
                         # Email mismatch - security issue, clear the stored email
                         print(f"Security: Email mismatch. Expected {stored_email}, got {user_info.get('email')}")
+                        clear_device_auth(device_id)
                         if 'last_authenticated_email' in st.session_state:
                             del st.session_state['last_authenticated_email']
     
@@ -354,7 +453,16 @@ def login():
 
 def logout():
     """Log out the current user."""
-    # Delete credentials file if email is known
+    # Get device ID from query params or session state
+    device_id = st.query_params.get('device_id') or st.session_state.get('device_id')
+    
+    # Clear device-specific authentication file
+    if device_id:
+        clear_device_auth(device_id)
+    
+    # Delete credentials file if email is known (optional - for full logout)
+    # Note: This deletes credentials for all devices. If you want device-specific logout only,
+    # comment out the delete_credentials_file call
     email = st.session_state.get('last_authenticated_email') or (st.session_state.get('user_info') or {}).get('email')
     if email:
         delete_credentials_file(email)
